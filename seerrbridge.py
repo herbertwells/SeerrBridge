@@ -1,5 +1,5 @@
 # =============================================================================
-# Soluify.com  |  Your #1 IT Problem Solver  |  {SeerrBridge v0.4.5} DEV
+# Soluify.com  |  Your #1 IT Problem Solver  |  {SeerrBridge v0.4.4}
 # =============================================================================
 #  __         _
 # (_  _ |   .(_
@@ -22,18 +22,22 @@ import re
 import inflect
 import requests
 import platform
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException, NoSuchElementException, TimeoutException
 from dotenv import load_dotenv
+from selenium.common.exceptions import StaleElementReferenceException, NoSuchElementException, TimeoutException
 from asyncio import Queue
 from datetime import datetime, timedelta
 from deep_translator import GoogleTranslator
 from fuzzywuzzy import fuzz
 from loguru import logger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from concurrent.futures import ThreadPoolExecutor
 
 # Configure loguru
 logger.remove()  # Remove default handler
@@ -58,7 +62,7 @@ OVERSEERR_API_KEY = os.getenv('OVERSEERR_API_KEY')
 TRAKT_API_KEY = os.getenv('TRAKT_API_KEY')
 HEADLESS_MODE = os.getenv("HEADLESS_MODE", "true").lower() == "true"
 ENABLE_AUTOMATIC_BACKGROUND_TASK = os.getenv("ENABLE_AUTOMATIC_BACKGROUND_TASK", "false").lower() == "true"
-TORRENT_FILTER_REGEX = os.getenv("TORRENT_FILTER_REGEX")
+TORRENT_FILTER_REGEXES = os.getenv("TORRENT_FILTER_REGEXES").split(',')
 
 # Confirm the interval is a valid number.
 try:
@@ -79,8 +83,8 @@ if not TRAKT_API_KEY:
     logger.error("TRAKT_API_KEY environment variable is not set.")
     exit(1)
 
-# Global driver variable to hold the Selenium WebDriver
-driver = None
+# Global drivers dictionary to hold multiple Selenium WebDriver instances
+drivers = {}
 
 # Initialize a global queue with a maximum size of 500
 request_queue = Queue(maxsize=500)
@@ -139,7 +143,7 @@ class WebhookPayload(BaseModel):
     extra: List[Dict[str, Any]] = []
 
 def refresh_access_token():
-    global RD_REFRESH_TOKEN, RD_ACCESS_TOKEN, driver
+    global RD_REFRESH_TOKEN, RD_ACCESS_TOKEN, drivers
 
     TOKEN_URL = "https://api.real-debrid.com/oauth/v2/token"
     data = {
@@ -165,7 +169,7 @@ def refresh_access_token():
             
             update_env_file()
 
-            if driver:
+            for driver in drivers.values():
                 driver.execute_script(f"""
                     localStorage.setItem('rd:accessToken', '{RD_ACCESS_TOKEN}');
                 """)
@@ -246,140 +250,114 @@ def login(driver):
 scheduler = AsyncIOScheduler()
 
 ### Browser Initialization and Persistent Session
-async def initialize_browser():
-    global driver
-    if driver is None:
-        logger.info("Starting persistent browser session.")
+async def initialize_browsers():
+    """Initialize multiple browser instances for each filter regex"""
+    global drivers
+    
+    for filter_regex in TORRENT_FILTER_REGEXES:
+        if filter_regex not in drivers:
+            logger.info(f"Starting browser session for filter: {filter_regex}")
+            
+            # Create browser options
+            options = Options()
 
-        # Detect the current operating system
-        current_os = platform.system().lower()  # Returns 'windows', 'linux', or 'darwin' (macOS)
-        logger.info(f"Detected operating system: {current_os}")
+            # Detect the current operating system
+            current_os = platform.system().lower()  # Returns 'windows', 'linux', or 'darwin' (macOS)
+            logger.info(f"Detected operating system: {current_os}")
 
-        options = uc.ChromeOptions()
+            ### Handle Docker/Linux-specific configurations
+            if current_os == "linux" and os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true":
+                logger.info("Detected Linux environment inside Docker. Applying Linux-specific configurations.")
 
-        ### Handle Docker/Linux-specific configurations
-        if current_os == "linux" and os.getenv("RUNNING_IN_DOCKER", "false").lower() == "true":
-            logger.info("Detected Linux environment inside Docker. Applying Linux-specific configurations.")
+                # Explicitly set the Chrome binary location
+                options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
 
-            # Explicitly set the Chrome binary location
-            options.binary_location = os.getenv("CHROME_BIN", "/usr/bin/google-chrome")
+                # Enable headless mode for Linux/Docker environments
+                options.add_argument("--headless=new")  # Updated modern headless flag
+                options.add_argument("--no-sandbox")  # Required for running as root in Docker
+                options.add_argument("--disable-dev-shm-usage")  # Handle shared memory limitations
+                options.add_argument("--disable-gpu")  # Disable GPU rendering for headless environments
+                options.add_argument("--disable-setuid-sandbox")  # Bypass setuid sandbox
 
-            # Enable headless mode for Linux/Docker environments
-            options.add_argument("--headless=new")  # Updated modern headless flag
-            options.add_argument("--no-sandbox")  # Required for running as root in Docker
-            options.add_argument("--disable-dev-shm-usage")  # Handle shared memory limitations
-            options.add_argument("--disable-gpu")  # Disable GPU rendering for headless environments
-            options.add_argument("--disable-setuid-sandbox")  # Bypass setuid sandbox
+            ### Handle Windows-specific configurations
+            elif current_os == "windows":
+                logger.info("Detected Windows environment. Applying Windows-specific configurations.")
 
-        ### Handle Windows-specific configurations
-        elif current_os == "windows":
-            logger.info("Detected Windows environment. Applying Windows-specific configurations.")
+            if HEADLESS_MODE:
+                options.add_argument("--headless=new")  # Modern headless mode for Chrome
+            options.add_argument("--disable-gpu")  # Disable GPU for Docker compatibility
+            options.add_argument("--no-sandbox")  # Required for running browser as root
+            options.add_argument("--disable-dev-shm-usage")  # Disable shared memory usage restrictions
+            options.add_argument("--disable-setuid-sandbox")  # Disable sandboxing for root permissions
+            options.add_argument("--enable-logging")
+            options.add_argument("--window-size=1920,1080")  # Set explicit window size to avoid rendering issues
 
-        if HEADLESS_MODE:
-            options.add_argument("--headless=new")  # Modern headless mode for Chrome
-        options.add_argument("--disable-gpu")  # Disable GPU for Docker compatibility
-        options.add_argument("--no-sandbox")  # Required for running browser as root
-        options.add_argument("--disable-dev-shm-usage")  # Disable shared memory usage restrictions
-        options.add_argument("--disable-setuid-sandbox")  # Disable sandboxing for root permissions
-        options.add_argument("--enable-logging")
-        options.add_argument("--window-size=1920,1080")  # Set explicit window size to avoid rendering issues
+            # WebDriver options to suppress infobars and disable automation detection
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-infobars")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+            options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36")
 
-        # WebDriver options to suppress infobars and disable automation detection
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-infobars")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36")
+            # Log initialization method
+            logger.info("Using WebDriver Manager for dynamic ChromeDriver downloads.")
 
-        # Log initialization method
-        logger.info("Using undetected-chromedriver for dynamic ChromeDriver downloads.")
-
-        # Use undetected-chromedriver to initialize the browser
-        driver = uc.Chrome(options=options)
-
-        try:
-
-            # Suppress 'webdriver' detection
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                  get: () => undefined
+            try:
+                # Initialize new driver for this filter
+                new_driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                
+                # Suppress 'webdriver' detection
+                new_driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                    "source": """
+                    Object.defineProperty(navigator, 'webdriver', {
+                      get: () => undefined
+                    })
+                    """
                 })
-                """
-            })
 
-            logger.success("Initialized Selenium WebDriver with WebDriver Manager.")
-            # Navigate to an initial page to confirm browser works
-            driver.get("https://debridmediamanager.com")
-            logger.success("Navigated to Debrid Media Manager page.")
+                # Initialize the browser session
+                new_driver.get("https://debridmediamanager.com")
+                new_driver.execute_script(f"""
+                    localStorage.setItem('rd:accessToken', '{RD_ACCESS_TOKEN}');
+                """)
+                new_driver.refresh()
+                login(new_driver)
+                
+                # Configure filter for this instance
+                try:
+                    settings_link = WebDriverWait(new_driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, "//span[contains(text(),'⚙️ Settings')]"))
+                    )
+                    settings_link.click()
+                    
+                    default_filter_input = WebDriverWait(new_driver, 10).until(
+                        EC.presence_of_element_located((By.ID, "dmm-default-torrents-filter"))
+                    )
+                    default_filter_input.clear()
+                    default_filter_input.send_keys(filter_regex)
+                    settings_link.click()
+                    
+                except Exception as ex:
+                    logger.error(f"Error configuring filter {filter_regex}: {ex}")
+                
+                # Store the driver in our dictionary
+                drivers[filter_regex] = new_driver
+                logger.success(f"Successfully initialized browser for filter: {filter_regex}")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize browser for filter {filter_regex}: {e}")
+                continue
+
+async def shutdown_browsers():
+    """Shutdown all browser instances"""
+    global drivers
+    for filter_regex, driver in drivers.items():
+        try:
+            driver.quit()
+            logger.warning(f"Closed browser for filter: {filter_regex}")
         except Exception as e:
-            logger.error(f"Failed to initialize Selenium WebDriver: {e}")
-            raise e
-
-        # Inject Real-Debrid access token and other credentials into local storage
-        driver.execute_script(f"""
-            localStorage.setItem('rd:accessToken', '{RD_ACCESS_TOKEN}');
-        """)
-        logger.info("Set Real-Debrid credentials in local storage.")
-
-        # Refresh the page to apply the local storage values
-        driver.refresh()
-        login(driver)
-        logger.success("Refreshed the page to apply local storage values.")
-        # After refreshing, call the login function to click the login button
-        # After successful login, click on "⚙️ Settings" to open the settings popup
-        try:
-
-            logger.info("Attempting to click the '⚙️ Settings' link.")
-            settings_link = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//span[contains(text(),'⚙️ Settings')]"))
-            )
-            settings_link.click()
-            logger.info("Clicked on '⚙️ Settings' link.")
-
-            # Locate the "Default torrents filter" input box and insert the regex
-            logger.info("Attempting to insert regex into 'Default torrents filter' box.")
-            default_filter_input = WebDriverWait(driver, 10).until(
-
-                EC.presence_of_element_located((By.ID, "dmm-default-torrents-filter"))
-            )
-            default_filter_input.clear()  # Clear any existing filter
-
-            # Use the regex from .env
-            default_filter_input.send_keys(TORRENT_FILTER_REGEX)
-
-            logger.info(f"Inserted regex into 'Default torrents filter' input box: {TORRENT_FILTER_REGEX}")
-
-            settings_link.click()
-            logger.success("Closed 'Settings' to save settings.")
-
-        except (TimeoutException, NoSuchElementException) as ex:
-            logger.error(f"Error while interacting with the settings: {ex}")
-            logger.error(f"Continuing without TORRENT_FILTER_REGEX")
-
-        # Navigate to the library section
-        logger.info("Navigating to the library section.")
-        driver.get("https://debridmediamanager.com/library")
-
-        # Wait for 2 seconds on the library page before further processing
-        try:
-            # Ensure the library page has loaded correctly (e.g., wait for a specific element on the library page)
-            library_element = WebDriverWait(driver, 2).until(
-                EC.presence_of_element_located((By.XPATH, "//div[@id='library-content']"))  # Adjust the XPath as necessary
-            )
-            logger.success("Library section loaded successfully.")
-        except TimeoutException:
-            logger.info("Library loading.")
-
-        # Wait for at least 2 seconds on the library page
-        logger.info("Waiting for 2 seconds on the library page.")
-        time.sleep(2)
-        logger.success("Completed waiting on the library page.")
-
-async def shutdown_browser():
-    global driver
-    if driver:
-        driver.quit()
-        logger.warning("Selenium WebDriver closed.")
-        driver = None
+            logger.error(f"Error closing browser for filter {filter_regex}: {e}")
+    drivers.clear()
 
 ### Function to process requests from the queue
 async def process_requests():
@@ -571,7 +549,7 @@ async def process_movie_requests():
     if not requests:
         logger.info("No requests to process")
         return
-    
+
     for request in requests:
         tmdb_id = request['media']['tmdbId']
         media_id = request['media']['id']
@@ -590,24 +568,34 @@ async def process_movie_requests():
         if not movie_details:
             logger.error(f"Failed to get media details for TMDB ID {tmdb_id}")
             continue
-        
+    
         media_title = f"{movie_details['title']} ({movie_details['year']})"
         logger.info(f"Processing {media_type} request: {media_title}")
-        
-        try:
-            # Pass media_type and extra_data to search_on_debrid
-            confirmation_flag = await asyncio.to_thread(search_on_debrid, media_title, driver, extra_data)
-            if confirmation_flag:
-                if mark_completed(media_id, tmdb_id):
-                    logger.success(f"Marked media {media_id} as completed in Overseerr")
-                else:
-                    logger.error(f"Failed to mark media {media_id} as completed in Overseerr")
-            else:
-                logger.info(f"Media {media_id} was not properly confirmed. Skipping marking as completed.")
-        except Exception as ex:
-            logger.critical(f"Error processing {media_type} request {media_title}: {ex}")
 
-    logger.info("Finished processing all current requests. Waiting for new requests.")
+        # Create tasks for each filter and run them in parallel
+        tasks = []
+        for filter_regex in TORRENT_FILTER_REGEXES:
+            logger.info(f"Creating search task for filter: {filter_regex}")
+            task = search_on_debrid_with_filter(media_title, filter_regex, extra_data)
+            tasks.append(task)
+
+        # Wait for all filters to complete regardless of results
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Check results after all searches complete
+        success = False
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Error in filter {TORRENT_FILTER_REGEXES[i]}: {result}")
+            elif result:
+                success = True
+                logger.success(f"Found match with filter: {TORRENT_FILTER_REGEXES[i]}")
+        
+        if success:
+            if mark_completed(media_id, tmdb_id):
+                logger.success(f"Marked media {media_id} as completed in Overseerr")
+        else:
+            logger.info(f"No matches found across any filters for {media_title}")
 
 def mark_completed(media_id: int, tmdb_id: int) -> bool:
     """Mark item as completed in overseerr"""
@@ -713,7 +701,7 @@ def attempt_button_click_with_state_check(button, result_box):
     """
     try:
         # Get the initial state of the button
-        initial_state = button.get_attribute("class")  # Or another attribute relevant to the state
+        initial_state = button.get_attribute("class")  # Fix: Changed getAttribute to get_attribute
         logger.info(f"Initial button state: {initial_state}")
 
         # Click the button
@@ -725,14 +713,12 @@ def attempt_button_click_with_state_check(button, result_box):
             lambda driver: button.get_attribute("class") != initial_state
         )
         logger.info("Button state changed successfully after clicking.")
-        return True  # Button was successfully clicked and handled
+        return True
 
     except TimeoutException:
         logger.warning("No state change detected after clicking the button within 2 seconds.")
-
     except StaleElementReferenceException:
         logger.error("Stale element reference encountered while waiting for button state change.")
-
     return False
 
 def parse_requested_seasons(extra_data):
@@ -853,8 +839,9 @@ def check_red_buttons(driver, movie_title, normalized_seasons, confirmed_seasons
                 red_button_title_normalized = normalize_title(red_button_title_text.split('(')[0].strip(), target_lang='en')
 
                 # Clean and normalize the movie title once outside the loop
-                movie_title_cleaned = clean_title(movie_title.split('(')[0].strip(), target_lang='en')
-                movie_title_normalized = normalize_title(movie_title.split('(')[0].strip(), target_lang='en')
+                movie_title_cleaned = movie_title.split('(')[0].strip()
+                movie_title_normalized = normalize_title(movie_title_cleaned)
+                logger.info(f"Searching for normalized movie title: {movie_title_normalized}")
 
                 logger.info(f"Red button {i} title: {red_button_title_cleaned}, Expected movie title: {movie_title_cleaned}")
 
@@ -942,7 +929,7 @@ def check_red_buttons(driver, movie_title, normalized_seasons, confirmed_seasons
     return confirmation_flag, confirmed_seasons
 
 ### Search Function to Reuse Browser
-def search_on_debrid(movie_title, driver, extra_data=None):
+def search_on_debrid(movie_title, driver_filter, extra_data=None):
     logger.info(f"Starting Selenium automation for movie: {movie_title}")
 
     # Extract requested seasons from the extra data
@@ -954,9 +941,9 @@ def search_on_debrid(movie_title, driver, extra_data=None):
     logger.info(f"Media type: {'TV Show' if is_tv_show else 'Movie'}")
 
     # Check if the driver is None before proceeding to avoid NoneType errors
-    if not driver:
+    if not driver_filter:
         logger.error("Selenium WebDriver is not initialized. Attempting to reinitialize.")
-        driver = initialize_browser()
+        driver_filter = initialize_browser()
 
     debrid_media_manager_base_url = "https://debridmediamanager.com/search?query="
     
@@ -967,12 +954,12 @@ def search_on_debrid(movie_title, driver, extra_data=None):
     logger.info(f"Search URL: {url}")
 
     try:
-        driver.get(url)
+        driver_filter.get(url)
         logger.success(f"Navigated to search results page for {movie_title}.")
         
         # Attempt to locate the elements
         try:
-            WebDriverWait(driver, 15).until(
+            WebDriverWait(driver_filter, 15).until(
                 EC.presence_of_element_located((By.XPATH, f"//a[contains(@href, '/movie/') or contains(@href, '/show/')]"))
             )
             logger.info("Elements are present. Continuing...")
@@ -987,9 +974,14 @@ def search_on_debrid(movie_title, driver, extra_data=None):
 
         # Find the movie result elements
         try:
-            movie_elements = WebDriverWait(driver, 10).until(
+            movie_elements = WebDriverWait(driver_filter, 10).until(
                 EC.presence_of_all_elements_located((By.XPATH, f"//a[contains(@href, '/movie/') or contains(@href, '/show/')]"))
             )
+
+            # If no results found for this filter, return False but don't raise exception
+            if not movie_elements:
+                logger.info(f"No results found for filter, continuing with other filters")
+                return False
 
             # Iterate over the movie elements to find the correct one
             for movie_element in movie_elements:
@@ -1029,7 +1021,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
         try:
             # Step 1: Check for Status Message
             try:
-                no_results_element = WebDriverWait(driver, 2).until(
+                no_results_element = WebDriverWait(driver_filter, 2).until(
                     EC.text_to_be_present_in_element(
                         (By.XPATH, "//div[@role='status' and contains(@aria-live, 'polite')]"),
                         "No results found"
@@ -1041,7 +1033,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
                 logger.warning("'No results found' message not detected. Proceeding to check for available torrents.")
 
             try:
-                status_element = WebDriverWait(driver, 5).until(
+                status_element = WebDriverWait(driver_filter, 5).until(
                     EC.presence_of_element_located(
                         (By.XPATH, "//div[@role='status' and contains(@aria-live, 'polite') and contains(text(), 'available torrents in RD')]")
                     )
@@ -1063,18 +1055,18 @@ def search_on_debrid(movie_title, driver, extra_data=None):
             logger.info("Waiting for 'Checking RD availability...' to appear.")
             
             # Determine if the current URL is for a TV show
-            current_url = driver.current_url
+            current_url = driver_filter.current_url
             is_tv_show = '/show/' in current_url
             logger.info(f"is_tv_show: {is_tv_show}")
             # Initialize a set to track confirmed seasons
             confirmed_seasons = set()
             
             # Step 2: Check if any red buttons (RD 100%) exist and verify the title for each
-            confirmation_flag, confirmed_seasons = check_red_buttons(driver, movie_title, normalized_seasons, confirmed_seasons, is_tv_show)
+            confirmation_flag, confirmed_seasons = check_red_buttons(driver_filter, movie_title, normalized_seasons, confirmed_seasons, is_tv_show)
 
             # Step 3: Wait for the "Checking RD availability..." message to disappear
             try:
-                WebDriverWait(driver, 15).until_not(
+                WebDriverWait(driver_filter, 15).until_not(
                     EC.text_to_be_present_in_element(
                         (By.XPATH, "//div[@role='status' and contains(@aria-live, 'polite')]"),
                         "Checking RD availability"
@@ -1086,7 +1078,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
 
             # Step 4: Wait for the "Found X available torrents in RD" message
             try:
-                status_element = WebDriverWait(driver, 15).until(
+                status_element = WebDriverWait(driver_filter, 15).until(
                     EC.presence_of_element_located(
                         (By.XPATH, "//div[@role='status' and contains(@aria-live, 'polite') and contains(text(), 'available torrents in RD')]")
                     )
@@ -1120,7 +1112,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
             # Initialize a set to track confirmed seasons
             confirmed_seasons = set()
             # Step 7: Check if any red button (RD 100%) exists again before continuing
-            confirmation_flag, confirmed_seasons = check_red_buttons(driver, movie_title, normalized_seasons, confirmed_seasons, is_tv_show)
+            confirmation_flag, confirmed_seasons = check_red_buttons(driver_filter, movie_title, normalized_seasons, confirmed_seasons, is_tv_show)
 
             # If a red button is confirmed, skip further processing
             if confirmation_flag:
@@ -1147,26 +1139,26 @@ def search_on_debrid(movie_title, driver, extra_data=None):
                         season_number = season.split()[-1]  # Assumes season is in the format "Season X"
 
                         # Get the base URL (root URL without the season number)
-                        base_url = driver.current_url.split("/")[:-1]  # Split the URL and remove the last part (season number)
+                        base_url = driver_filter.current_url.split("/")[:-1]  # Split the URL and remove the last part (season number)
                         base_url = "/".join(base_url)  # Reconstruct the base URL
 
                         # Construct the new URL by appending the season number
                         season_url = f"{base_url}/{season_number}"
 
                         # Navigate to the new URL
-                        driver.get(season_url)
+                        driver_filter.get(season_url)
                         time.sleep(2)  # Wait for the page to load
                         logger.info(f"Navigated to season {season} URL: {season_url}")
 
                         # Perform red button checks for the current season
-                        confirmation_flag, confirmed_seasons = check_red_buttons(driver, movie_title, normalized_seasons, confirmed_seasons, is_tv_show)
+                        confirmation_flag, confirmed_seasons = check_red_buttons(driver_filter, movie_title, normalized_seasons, confirmed_seasons, is_tv_show)
                         # If a red button is confirmed, skip further processing for this season
                         if confirmation_flag and is_tv_show:
                             logger.success(f"Red button confirmed for {season}. Skipping further processing for this season.")
                             continue
                         # Re-locate the result boxes after navigating to the new URL
                         try:
-                            result_boxes = WebDriverWait(driver, 10).until(
+                            result_boxes = WebDriverWait(driver_filter, 10).until(
                                 EC.presence_of_all_elements_located((By.XPATH, "//div[contains(@class, 'border-black')]"))
                             )
                         except TimeoutException:
@@ -1232,7 +1224,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
 
                                         # Perform RD status checks after clicking the button
                                         try:
-                                            rd_button = WebDriverWait(driver, 10).until(
+                                            rd_button = WebDriverWait(driver_filter, 10).until(
                                                 EC.presence_of_element_located((By.XPATH, ".//button[contains(text(), 'RD (')]"))
                                             )
                                             rd_button_text = rd_button.text
@@ -1267,7 +1259,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
 
                                         # Perform RD status checks after clicking the button
                                         try:
-                                            rd_button = WebDriverWait(driver, 10).until(
+                                            rd_button = WebDriverWait(driver_filter, 10).until(
                                                 EC.presence_of_element_located((By.XPATH, ".//button[contains(text(), 'RD (')]"))
                                             )
                                             rd_button_text = rd_button.text
@@ -1304,7 +1296,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
                     # Handle movies or TV shows without specific seasons
                     # Re-locate the result boxes after navigating to the new URL
                     try:
-                        result_boxes = WebDriverWait(driver, 10).until(
+                        result_boxes = WebDriverWait(driver_filter, 10).until(
                             EC.presence_of_all_elements_located((By.XPATH, "//div[contains(@class, 'border-black')]"))
                         )
                     except TimeoutException:
@@ -1384,7 +1376,7 @@ def search_on_debrid(movie_title, driver, extra_data=None):
 
                                 # Perform RD status checks after clicking the button
                                 try:
-                                    rd_button = WebDriverWait(driver, 10).until(
+                                    rd_button = WebDriverWait(driver_filter, 10).until(
                                         EC.presence_of_element_located((By.XPATH, ".//button[contains(text(), 'RD (')]"))
                                     )
                                     rd_button_text = rd_button.text
@@ -1429,6 +1421,19 @@ def search_on_debrid(movie_title, driver, extra_data=None):
 
     except Exception as ex:
         logger.critical(f"Error during Selenium automation: {ex}")
+
+async def search_on_debrid_with_filter(movie_title, filter_regex, extra_data=None):
+    """Asynchronously search using a specific filter's browser instance"""
+    try:
+        if filter_regex not in drivers:
+            logger.error(f"No browser instance for filter: {filter_regex}")
+            return
+        driver_instance = drivers[filter_regex]
+        logger.info(f"Using browser instance with filter: {filter_regex}")
+        return await asyncio.to_thread(search_on_debrid, movie_title, driver_instance, extra_data)
+    except Exception as e:
+        logger.error(f"Error in search_on_debrid_with_filter for {filter_regex}: {e}")
+        return False
 
 async def get_user_input():
     try:
@@ -1521,11 +1526,11 @@ async def startup_event():
     # Check and refresh access token before any other initialization
     check_and_refresh_access_token()
 
-    # Always initialize the browser when the bot is ready
+    # Initialize all browser instances
     try:
-        await initialize_browser()
+        await initialize_browsers()
     except Exception as e:
-        logger.error(f"Failed to initialize browser: {e}")
+        logger.error(f"Failed to initialize browsers: {e}")
         return
 
     # Start the request processing task if not already started
@@ -1557,8 +1562,12 @@ def schedule_recheck_movie_requests():
     scheduler.add_job(process_movie_requests, 'interval', minutes=REFRESH_INTERVAL_MINUTES)
     logger.info(f"Scheduled rechecking movie requests every {REFRESH_INTERVAL_MINUTES} minute(s).")
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    await shutdown_browsers()
+
 async def on_close():
-    await shutdown_browser()  # Ensure browser is closed when the bot closes
+    await shutdown_browsers()  # Ensure browser is closed when the bot closes
 
 async def check_overseerr_base_url(url: str) -> bool:
     try:
